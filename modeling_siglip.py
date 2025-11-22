@@ -50,7 +50,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
         self.register_buffer(
             "position_ids",
-            torch.arrange(self.num_positions).expand((1, -1)),  # [1, self.num_positions]  
+            torch.arange(self.num_positions).expand((1, -1)),  # [1, self.num_positions]  
             persistent = False                                  # 表示这个缓冲区在保存模型时不会被保存
         )
 
@@ -76,7 +76,7 @@ class SiglipAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
     def forward(self, hidden_states: torch.Tensor):
         batch_size, seq_len, _ = hidden_states.shape
@@ -85,9 +85,9 @@ class SiglipAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).tranpose(1, 2)
-        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).tranpose(1, 2)
-        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).tranpose(1, 2)
+        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
 
@@ -138,7 +138,7 @@ class SiglipEncoderLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
+        hidden_states, _ = self.self_attn(hidden_states)
         hidden_states = hidden_states + residual
 
         residual = hidden_states
@@ -151,7 +151,7 @@ class SiglipEncoder(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([SiglipEncoderLayer(config)] for _ in range(self.config.num_hidden_layers))
+        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(self.config.num_hidden_layers)])
 
     def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = input_embeds

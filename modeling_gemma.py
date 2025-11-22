@@ -22,6 +22,16 @@ class KVCache():
         value_states: torch.Tensor,
         layer_idx: int,
     ):
+        r"""
+        Update the KV-Cache with new key and value states.
+        在prefill阶段, 会将整个句子放入到模型中, 然后将key和value填充到kv_cache中。在decoding阶段, 会只将1个token放入到模型中, 然后去获取kv_cache里面的信息进行concat, 从而实现自回归生成。
+        Args:
+            key_states (torch.Tensor): The key states to be added to the cache. Shape: (batch_size, num_heads_kv, seq_len, head_dim)
+            value_states (torch.Tensor): The value states to be added to the cache. Shape: (batch_size, num_heads_kv, seq_len, head_dim)
+            layer_idx (int): The index of the layer for which the cache is being updated.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: The updated key and value caches for the specified layer
+        """
         if len(self.key_cache) <= layer_idx:
             # If we never add anything to the KV-Cache of this layer, let us create it.
             self.key_cache.append(key_states)
@@ -31,7 +41,7 @@ class KVCache():
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim = -2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim = -2)
         
-        return self.key_cache[layer_idx], self.key_cache[layer_idx]
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 class GemmaConfig():
     def __init__(
@@ -221,9 +231,9 @@ class GemmaAttention(nn.Module):
             **kwargs,
             ):
         batch_size, q_len, _ = hidden_states.size()
-        query = self.q_proj(query)
-        key = self.v_proj(key)
-        value = self.v_proj(value)
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
         query = query.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(batch_size, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value = value.view(batch_size, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -238,12 +248,12 @@ class GemmaAttention(nn.Module):
         key = repeat_kv(key, self.num_key_value_groups)
         value = repeat_kv(value, self.num_key_value_groups)
 
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
         assert attention_mask is not None
         attn_weights = attn_weights + attention_mask
-
-        attn_weights = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
         attn_weights = nn.functional.softmax(attn_weights, dim = -1).type_as(query)
         attn_weights = nn.functional.dropout(attn_weights, p = self.attention_dropout)
+        attn_output = torch.matmul(attn_weights, value)
 
         attn_output = attn_output.transpose(1,2).contiguous()
         attn_output = attn_output.view(batch_size, q_len, -1)
@@ -303,11 +313,11 @@ class GemmaModel(nn.Module):
             self,
             attention_mask:Optional[torch.Tensor]=None,
             position_ids:Optional[torch.LongTensor]=None,
-            input_embs:Optional[torch.FloatTensor]=None,
+            inputs_embeds:Optional[torch.FloatTensor]=None,
             kv_cache:Optional[KVCache]=None
     )->torch.FloatTensor:
         
-        hidden_states = input_embs
+        hidden_states = inputs_embeds
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
@@ -323,31 +333,31 @@ class GemmaForCausalLM(nn.Module):
         self.config = config
         self.model = GemmaModel(config)
         self.vocab_size = self.config.vocab_size
-        self.llm_head = nn.linear(config.hidden_size, config.vocab_size, bias=False)
+        self.llm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
     
     def tie_weights(self):
-        self.lm_head.weight = self.model.embed_tokens.weight
+        self.llm_head.weight = self.model.embed_tokens.weight
 
     def forward(
             self,
             attention_mask:Optional[torch.Tensor]=None,
             position_ids:Optional[torch.Tensor]=None,
-            inputs_embeds:Optional[torch.Tensor]=None,
+            input_embeds:Optional[torch.Tensor]=None,
             kv_cache:Optional[KVCache]=None,
     ) ->Tuple:
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=input_embeds,
             kv_cache=kv_cache,
         )
 
         hidden_states = outputs
         logits = self.llm_head(hidden_states)
-        logits = logits.float
+        logits = logits.float()
 
         return_data = {"logits":logits}
 
@@ -377,6 +387,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         language_model = GemmaForCausalLM(config.text_config)
         self.language_model = language_model
 
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+
     def tie_weights(self):
         return self.language_model.tie_weights()
 
@@ -394,6 +406,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         pad_mask = input_ids == self.pad_token_id
 
         # We need to expand the masks to the embedding dimension otherwise wo can not use them in torch.where
+        # [batch_size, seq_len] -> [batch_size, seq_len, 1] -> [batch_size, seq_len, embed_dim]
         text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
@@ -404,6 +417,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Choose the text embeddings、Insert the image embeddings、Zero out padding tokens
         final_embedding = torch.where(text_mask_expanded, input_embeds, final_embedding)
         # NOTE: masked_scatter -> torch.masked_scatter(input, mask, source):将source张亮的元素复制到input张量中mask为True的位置。复制是按顺序进行的，从左到右遍历所有元素。
+        # 即将scaled_image_features中的元素, 按顺序填充到final_embedding中image_mask_expanded为True的位置。
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
 
