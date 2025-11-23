@@ -144,12 +144,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch_size, num_key_value_heads * n_rep, seq_len, head_dim)
 
 def rotate_half(x):
+    """Helper function to rotate half the hidden dims of the input."""
     # Build the [-x2, x1, -x4, x3, ...] tensor for the sin part of the positional encoding.
     x1 = x[..., : x.shape[-1] // 2] # Takes the first half of the last dimension
     x2 = x[..., x.shape[-1] // 2 :] # Takes the second half of the last dimension
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Apply the rotary positional embeddings to the query and key tensors."""
     cos = cos.unsqueeze(unsqueeze_dim) # Add the head dimension
     sin = sin.unsqueeze(unsqueeze_dim) # Add the head dimension
     # Apply the formula (34) of the Rotary Positional Encoding paper.
@@ -171,18 +173,16 @@ class GemmaRotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
+        """"得到cosine和sine矩阵, 用于后续的旋转位置编码计算"""
         self.inv_freq.to(x.device)
         # Copy the inv_freq tensor for batch in the sequence
-        # inv_freq_expanded: [Batch_Size, Head_Dim // 2, 1]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        # position_ids_expanded: [Batch_Size, 1, Seq_Len]
         position_ids_expanded = position_ids[:, None, :].float()
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             # Multiply each theta by the position (which is the argument of the sin and cos functions)
-            # freqs: [Batch_Size, Head_Dim // 2, 1] @ [Batch_Size, 1, Seq_Len] --> [Batch_Size, Seq_Len, Head_Dim // 2]
+            # NOTE: freqs就相当于论文中的m*theta, 其中m是位置索引，theta是inv_freq_expanded
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             # emb: [Batch_Size, Seq_Len, Head_Dim]
             emb = torch.cat((freqs, freqs), dim=-1)
@@ -239,6 +239,8 @@ class GemmaAttention(nn.Module):
         value = value.view(batch_size, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         
         cos, sin = self.rotary_emb(value, position_ids, seq_len = None)
+        # NOTE: ROPE修改了注意力机制, 使得生成的注意力分数依赖于两个token之间的相对距离。
+        # 此外，随着token之间距离的增加, 这个注意力分数会衰减。
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         if kv_cache is not None:
@@ -444,6 +446,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Add the head dimension
         casual_mask = casual_mask.unsqueeze(1)
 
+        # NOTE: 创建位置编码position_ids, ROPE需要知道每个token在序列中的确切位置来计算旋转角度
         if kv_cache is not None and kv_cache.num_items() > 0:
             # The position of the query is just the last position
             position_ids = attention_mask.cumsum(1)[:, -1]
@@ -451,6 +454,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 position_ids = position_ids.unsqueeze(0)
         else:
             # Create the position ids based on the size of the attention mask
+            # NOTE: attention_mask.cumsum(-1): 对attention_mask的最后一个维度进行累加，得到每个位置的绝对位置索引。
             position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device)
         
         return final_embedding, casual_mask, position_ids
