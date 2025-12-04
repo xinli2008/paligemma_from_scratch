@@ -89,10 +89,11 @@ def test_inference(
 
         # Sample the next token
         if do_sample:
-            # Apply temperature
-            # NOTE: temperature的作用主要是: 控制概率分布的平滑程度
+            # NOTE: temperature控制生成文本的随机性, 通过调整概率分布的平滑程度来影响采样行为。
+            # NOTE: 当temperature较高时（如 1.5）, 概率分布会变得更平滑，低概率的词汇也有更高的可能性被采样，生成的文本更加随机。
+            # NOTE: 当temperature较低时（如 0.5）, 概率分布会变得更尖锐，模型更倾向于选择高概率的词汇，生成的文本更加确定性。
             next_token_logits = torch.softmax(next_token_logits / temperature, dim = -1)
-            # NOTE：选择累计概率打到top_p的最小token集合，然后从这个集合中进行加权随机采样
+            # NOTE: 选择累计概率打到top_p的最小token集合，然后从这个集合中进行加权随机采样
             next_token = _sample_top_p(next_token_logits, top_p)
         else:
             # NOTE：贪心选择
